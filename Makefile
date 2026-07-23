@@ -1,9 +1,10 @@
 CFLAGS ?= -Wall -Wextra -pedantic -Werror -std=gnu11 -Og -g
 LDFLAGS ?= -O1 -static
+BINARIES = seccomp-dump
 
-default: seccomp-dump
+default: $(BINARIES)
 
-seccomp-dump: src/main.c
+%: %.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 .PHONY: default clean
