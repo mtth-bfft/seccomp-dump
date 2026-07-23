@@ -1,179 +1,141 @@
+#define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/filter.h>
-#include <linux/seccomp.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
-typedef enum {
-    MODE_BRIEF,
-    MODE_HEXDUMP,
-    MODE_DISASSEMBLY,
-    MODE_PROLOG,
-} output_mode_t;
-
-extern void bpf_hexdump(FILE *fout, const struct sock_filter *filter, size_t count);
-extern void bpf_disassemble(FILE *fout, struct sock_filter *filter, size_t count);
-extern void bpf_prolog(FILE *fout, const struct sock_filter *filter, size_t count);
+const mode_t FILE_MODE = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+const int OPEN_MODE = O_WRONLY | O_CREAT | O_EXCL;
 
 void print_usage()
 {
-    fprintf(stderr, "Usage: seccomp-dump                <thread id> (brief summary)\n");
-    fprintf(stderr, "       seccomp-dump [-o <path>] -x <thread id> (show as hexdump)\n");
-    fprintf(stderr, "       seccomp-dump [-o <path>] -d <thread id> (show as disassembly)\n");
-    fprintf(stderr, "       seccomp-dump [-o <path>] -p <thread id> (show as prolog facts)\n");
+	fprintf(stderr, "Usage: seccomp-dump <thread_id> <output_path>\n");
+	fprintf(stderr, "If a directory is provided, the TID will be used as filename.\n");
+	fprintf(stderr, "Filter numbers will be appended, starting from 0.\n");
+	fprintf(stderr, "\n");
 }
 
 int main(int argc, char* argv[])
 {
-    int opt;
-    int mode = MODE_BRIEF;
-    FILE *fout = stdout;
-    int res = 0;
-    pid_t tid = 0;
-    int wstatus = 0;
-    size_t total_size = sizeof(struct sock_fprog*);
-    size_t filter_count = 0;
-    struct sock_fprog **progs = NULL;
+	pid_t tid;
+	int out_dir;
+	int res;
+	int wstatus = 0;
+	size_t filter_idx;
 
-    while ((opt = getopt(argc, argv, "xdpo:")) != -1)
-    {
-        switch (opt) {
-	case 'x':
-            mode = MODE_HEXDUMP;
-	    break;
-        case 'd':
-            mode = MODE_DISASSEMBLY;
-	    break;
-	case 'p':
-	    mode = MODE_PROLOG;
-	    break;
-	case 'o':
-            fout = fopen(optarg, "w");
-            if (fout == NULL)
-            {
-                perror("fopen()");
-                res = errno;
-                goto cleanup;
-            }
-	    break;
-	default:
-	    print_usage();
-	    return 1;
+	if (argc != 3) {
+		print_usage();
+		return 1;
 	}
-    }
-
-    tid = (pid_t)atol(argv[argc - 1]);
-    if (optind != argc - 1 || tid == 0)
-    {
-	print_usage();
-	res = 1;
-	goto cleanup;
-    }
-
-    res = ptrace(PTRACE_ATTACH, tid, NULL, NULL);
-    if (res < 0)
-    {
-        perror("ptrace(PTRACE_ATTACH)");
-        res = errno;
-        goto cleanup;
-    }
-
-    res = waitpid(tid, &wstatus, 0);
-    if (res <= 0)
-    {
-        perror("waitpid()");
-        res = errno;
-        goto cleanup;
-    }
-    else if (!WIFSTOPPED(wstatus))
-    {
-        fprintf(stderr, "Unable to stop process for inspection: signal delivery failed\n");
-        res = 1;
-        goto cleanup;
-    }
-
-    while (res >= 0)
-    {
-        res = ptrace(PTRACE_SECCOMP_GET_FILTER, tid, (void*)filter_count, NULL);
-        if (res < 0 && errno == ESRCH)
-        {
-            fprintf(stderr, "Process resumed spuriously, or died during inspection\n");
-            res = 1;
-            goto cleanup;
-        }
-        else if (res < 0 && errno == EINVAL)
-        {
-            fprintf(stderr, "TID %llu has no seccomp filter attached\n", (unsigned long long)tid);
-	    goto cleanup;
+	tid = (pid_t)atol(argv[1]);
+	if (tid == 0) {
+		fprintf(stderr, "Error: invalid thread ID\n");
+		print_usage();
+		return 1;
 	}
-        else if (res < 0 && errno == ENOENT)
-        {
-            break; // end of list
-        }
-        else if (res < 0)
-        {
-            perror("ptrace(PTRACE_SECCOMP_GET_FILTER, x, NULL)");
-            res = errno;
-            goto cleanup;
-        }
-        total_size += sizeof(struct sock_fprog*) + sizeof(struct sock_fprog) + \
-            res * sizeof(struct sock_filter);
-        filter_count++;
-    }
 
-    progs = calloc(total_size, 1);
-    if (progs == NULL)
-    {
-        fprintf(stderr, "Error: out of memory\n");
-	_exit(ENOMEM);
-    }
-    for (size_t filter_idx = 0; filter_idx < filter_count; filter_idx++)
-    {
-	progs[filter_idx] = ((struct sock_fprog*)&progs[filter_count+1]) + filter_idx;
-	progs[filter_idx]->filter = (struct sock_filter*)(
-		((struct sock_fprog*)&progs[filter_count+1]) + filter_count);
-        res = ptrace(PTRACE_SECCOMP_GET_FILTER, tid, (void*)filter_idx,
-	    progs[filter_idx]->filter);
-        if (res < 0 && errno == ESRCH)
-        {
-            fprintf(stderr, "Process resumed spuriously, or died during inspection\n");
-            res = 1;
-            goto cleanup;
-        }
-        else if (res < 0 && errno == ENOENT)
-        {
-            filter_count = filter_idx;
-            break;
-        }
-        else if (res < 0)
-        {
-            perror("ptrace(PTRACE_SECCOMP_GET_FILTER, x, NULL)");
-            res = errno;
-            goto cleanup;
-        }
-        progs[filter_idx]->len = res;
-    }
+	// Is the output_path a directory?
+	out_dir = open(argv[2], O_PATH | O_DIRECTORY);
 
-    fprintf(stderr, "TID %zd has %zu filter%s attached\n",
-        (size_t)tid, filter_count, filter_count > 1 ? "s" : "");
-    for (size_t filter_idx = 0; filter_idx < filter_count; filter_idx++)
-    {
-        fprintf(stderr, "Filter %zu: %u instruction(s)\n", filter_idx, progs[filter_idx]->len);
-        if (mode == MODE_HEXDUMP)
-            bpf_hexdump(fout, progs[filter_idx]->filter, progs[filter_idx]->len);
-        else if (mode == MODE_DISASSEMBLY)
-	    bpf_disassemble(fout, progs[filter_idx]->filter, progs[filter_idx]->len);
-        else if (mode == MODE_PROLOG)
-	    bpf_prolog(fout, progs[filter_idx]->filter, progs[filter_idx]->len);
-    }
+	res = ptrace(PTRACE_ATTACH, tid, NULL, NULL);
+	if (res < 0) {
+		res = errno;
+		perror("ptrace(PTRACE_ATTACH)");
+		goto cleanup;
+	}
+	res = waitpid(tid, &wstatus, 0);
+	if (res <= 0) {
+		res = errno;
+		perror("waitpid()");
+		goto cleanup;
+	}
+	else if (!WIFSTOPPED(wstatus)) {
+		res = 1;
+		fprintf(stderr, "Error: unable to stop process for inspection: signal delivery failed\n");
+		goto cleanup;
+	}
+
+	// Iterate on all loaded filters, 0 is the most recently loaded
+	for (filter_idx = 0; ; filter_idx += 1) {
+		int filter_len;
+		struct sock_filter *filter;
+		char out_file[255];
+		int out_fd;
+		ssize_t bytes_written;
+
+		filter_len = ptrace(PTRACE_SECCOMP_GET_FILTER, tid, (void*)filter_idx, NULL);
+		if (filter_len < 0 && errno == ENOENT) {
+			break; // end of list, expected
+		}
+		else if (filter_len < 0 && errno == EINVAL) {
+			printf("Thread %d has no seccomp filter attached\n", tid);
+			goto cleanup;
+		}
+		else if (filter_len < 0 && errno == ESRCH) {
+			res = 1;
+			fprintf(stderr, "Error: Process resumed spuriously, or died during inspection\n");
+			goto cleanup;
+		}
+		else if (filter_len < 0) {
+			res = errno;
+			perror("ptrace(PTRACE_SECCOMP_GET_FILTER)");
+			goto cleanup;
+		}
+
+		if (out_dir >= 0) {
+			snprintf(out_file, sizeof(out_file), "%d.%zu", tid, filter_idx);
+			out_fd = openat(out_dir, out_file, OPEN_MODE, FILE_MODE);
+		}
+		else {
+			snprintf(out_file, sizeof(out_file), "%s.%zu", argv[2], filter_idx);
+			out_fd = open(out_file, OPEN_MODE, FILE_MODE);
+		}
+		if (out_fd < 0) {
+			res = errno;
+			fprintf(stderr, "Error: could not create file %s : %s\n", out_file, strerror(errno));
+			goto cleanup;
+		}
+
+		filter = calloc(filter_len, sizeof(struct sock_filter));
+		if (filter == NULL) {
+			fprintf(stderr, "Error: requested %zu bytes, out of memory\n", filter_len * sizeof(struct sock_filter));
+			_exit(ENOMEM);
+		}
+		filter_len = ptrace(PTRACE_SECCOMP_GET_FILTER, tid, (void*)filter_idx, filter);
+		if (filter_len < 0 && errno == ESRCH) {
+			res = 1;
+			fprintf(stderr, "Error: Process resumed spuriously, or died during inspection\n");
+			free(filter);
+			goto cleanup;
+		}
+		else if (filter_len < 0) {
+			res = errno;
+			perror("ptrace(PTRACE_SECCOMP_GET_FILTER)");
+			free(filter);
+			goto cleanup;
+		}
+		printf("Filter %zu : %u instructions\n", filter_idx, filter_len);
+		bytes_written = write(out_fd, filter, filter_len * sizeof(struct sock_filter));
+		if (bytes_written != (ssize_t)(filter_len * sizeof(struct sock_filter))) {
+			res = errno;
+			fprintf(stderr, "Error: could not write to file %s (code %u)\n", out_file, errno);
+			free(filter);
+			close(out_fd);
+			goto cleanup;
+		}
+		free(filter);
+		close(out_fd);
+	}
+	printf("Successfully dumped %zu filter%s\n",
+		filter_idx, filter_idx > 1 ? "s" : "");
 
 cleanup:
-    if (progs != NULL)
-        free(progs);
-    return res;
+	if (out_dir >= 0)
+		close(out_dir);
+	return res;
 }
