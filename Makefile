@@ -1,5 +1,5 @@
 CFLAGS ?= -Wall -Wextra -pedantic -Werror -std=gnu11 -Og -g
-LDFLAGS ?= -O1
+LDFLAGS ?= -O1 -static
 
 default: seccomp-dump
 
