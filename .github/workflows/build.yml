@@ -10,3 +10,13 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build
       run: make
+    - name: Create output directory
+      run: mkdir /tmp/out
+    - name: Test on non-sandboxed process
+      run: sudo ./seccomp-dump $$ /tmp/out/ | grep -i "no seccomp filter"
+    - name: Prepare dummy seccomp-ed container
+      run: podman run -d --rm alpine /bin/sh -c "sleep 15"
+    - name: Test on dummy seccomp-ed container
+      run: sudo ./seccomp-dump `pidof sleep` /tmp/out/ | grep -i "dumped 1 filter"
+    - name: Assert a file has been created
+      run: stat /tmp/out/`pidof sleep`.0
