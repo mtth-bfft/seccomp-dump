@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      BIN: seccomp-dump
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          make "$BIN"
+
+      - name: Checksum
+        run: sha256sum "$BIN" | tee "$BIN.sha256"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.BIN }}
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$BIN" "$BIN.sha256" --verify-tag --generate-notes
